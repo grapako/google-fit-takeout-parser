@@ -1,0 +1,6 @@
+# Optional but strongly recommended: ~5-10x faster JSON parsing
+# Install with: pip install orjson
+orjson>=3.9.0
+
+# All other dependencies are Python stdlib (no installation needed):
+# sqlite3, pathlib, csv, xml.etree.ElementTree, argparse, datetime
