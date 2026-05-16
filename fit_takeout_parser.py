@@ -373,8 +373,10 @@ def parse_all_data(folder: Path) -> Generator[tuple, None, None]:
             origin_id    = point.get("originDataSourceId", "")
             data_type    = point.get("dataTypeName", "")
 
-            # Strip verbose "com.google." prefix for readability
-            clean_type = data_type.replace("com.google.", "")
+            # Strip verbose "com.google." prefix — only from the start of the string.
+            # Using removeprefix() avoids corrupting types that contain "com.google."
+            # in a non-prefix position (which replace() would incorrectly modify).
+            clean_type = data_type.removeprefix("com.google.")
 
             try:
                 start_ns = int(start_ns_str)
@@ -819,27 +821,39 @@ def export_csv(
             conditions.append(f"data_type IN ({ph})")
             params.extend(data_types)
         if from_dt:
-            conditions.append("start_dt >= ?")
-            params.append(from_dt)
+            # Compare against the date portion of start_dt (first 10 chars: YYYY-MM-DD)
+            # to avoid timezone-offset issues in lexicographic comparison.
+            conditions.append("substr(start_dt, 1, 10) >= ?")
+            params.append(from_dt[:10])
         if to_dt:
-            conditions.append("start_dt <= ?")
-            params.append(to_dt + "T23:59:59" if len(to_dt) == 10 else to_dt)
+            conditions.append("substr(start_dt, 1, 10) <= ?")
+            params.append(to_dt[:10])
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         query = f"SELECT * FROM {table} {where} ORDER BY start_ns"
-        rows  = conn.execute(query, params).fetchall()
 
-        if not rows:
+        # Stream via cursor — avoids loading millions of rows into RAM at once.
+        cursor = conn.execute(query, params)
+        fieldnames = [d[0] for d in cursor.description]
+
+        out_file = output_dir / f"{table}_{suffix}.csv"
+        written  = 0
+        with open(out_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            while True:
+                chunk = cursor.fetchmany(10_000)
+                if not chunk:
+                    break
+                writer.writerows([dict(zip(fieldnames, row)) for row in chunk])
+                written += len(chunk)
+
+        if written == 0:
+            out_file.unlink(missing_ok=True)
             print(f"  [CSV] {table}: no data for the specified filters.")
             continue
 
-        out_file = output_dir / f"{table}_{suffix}.csv"
-        with open(out_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows([dict(r) for r in rows])
-
-        print(f"  [CSV] {table} → {out_file}  ({len(rows):,} rows)")
+        print(f"  [CSV] {table} → {out_file}  ({written:,} rows)")
 
     conn.close()
 
@@ -876,15 +890,22 @@ def generate_summary(db_path: Path, output_path: Optional[Path] = None) -> dict:
             continue
 
         total_rows = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        # Bug fix: use COALESCE(value_fp, value_int) so that integer-only types
+        # (step_count, heart_rate.bpm, etc.) report meaningful statistics instead
+        # of null. The parser correctly stores those values in value_int.
         rows = conn.execute(f"""
             SELECT
                 data_type, source_app,
-                COUNT(*)      AS n,
-                MIN(start_dt) AS first_dt,
-                MAX(start_dt) AS last_dt,
-                AVG(value_fp) AS mean_fp,
-                MIN(value_fp) AS min_fp,
-                MAX(value_fp) AS max_fp
+                COUNT(*)                                              AS n,
+                MIN(start_dt)                                         AS first_dt,
+                MAX(start_dt)                                         AS last_dt,
+                AVG(COALESCE(value_fp, CAST(value_int AS REAL)))      AS mean_v,
+                MIN(COALESCE(value_fp, CAST(value_int AS REAL)))      AS min_v,
+                MAX(COALESCE(value_fp, CAST(value_int AS REAL)))      AS max_v,
+                SUM(CASE WHEN value_fp  IS NOT NULL THEN 1 ELSE 0 END) AS n_fp,
+                SUM(CASE WHEN value_int IS NOT NULL THEN 1 ELSE 0 END) AS n_int,
+                SUM(CASE WHEN value_fp IS NULL AND value_int IS NULL
+                          THEN 1 ELSE 0 END)                          AS n_no_value
             FROM {table}
             GROUP BY data_type, source_app
             ORDER BY data_type, n DESC
@@ -894,10 +915,17 @@ def generate_summary(db_path: Path, output_path: Optional[Path] = None) -> dict:
             "total_rows": total_rows,
             "data_types": [
                 {
-                    "data_type":  r[0], "source_app": r[1],
-                    "n":          r[2], "first_dt": r[3], "last_dt": r[4],
-                    "mean_fp":    round(r[5], 4) if r[5] is not None else None,
-                    "min_fp":     r[6], "max_fp": r[7],
+                    "data_type":   r[0],
+                    "source_app":  r[1],
+                    "n":           r[2],
+                    "first_dt":    r[3],
+                    "last_dt":     r[4],
+                    "mean":        round(r[5], 4) if r[5] is not None else None,
+                    "min":         r[6],
+                    "max":         r[7],
+                    "n_fp":        r[8],   # rows with float value
+                    "n_int":       r[9],   # rows with integer value
+                    "n_no_value":  r[10],  # rows with neither (event-only markers)
                 }
                 for r in rows
             ],
