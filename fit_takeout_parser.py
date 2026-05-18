@@ -46,6 +46,7 @@ Usage:
 
 import argparse
 import csv
+import os
 import sqlite3
 import sys
 import time
@@ -55,95 +56,156 @@ from pathlib import Path
 from typing import Generator, Iterator, Optional
 
 # ---------------------------------------------------------------------------
-# JSON backend: orjson if available, fallback to stdlib
+# JSON backend: orjson if available, stdlib fallback at the call level
 # ---------------------------------------------------------------------------
 try:
-    import orjson
-
-    def load_json(path: Path) -> dict:
-        """Load a JSON file using orjson (faster)."""
-        return orjson.loads(path.read_bytes())
-
-    JSON_BACKEND = "orjson"
+    import orjson as _orjson
+    _HAS_ORJSON = True
 except ImportError:
-    import json as _json_stdlib
+    _HAS_ORJSON = False
 
-    def load_json(path: Path) -> dict:
-        """Load a JSON file using stdlib json (fallback)."""
+import json as _json_stdlib
+
+
+def load_json(path: Path) -> dict:
+    """
+    Load a JSON file, attempting orjson first for speed.
+
+    orjson is ~5–10x faster but has two failure modes on large files:
+      1. Memory allocation error (very large files, e.g. heart_rate.bpm)
+      2. Any other parse error
+
+    In both cases we fall back transparently to stdlib json, which reads
+    the file incrementally and does not require the full content in RAM.
+    The fallback is per-call, so one large file does not disable orjson
+    for the rest of the run.
+    """
+    if _HAS_ORJSON:
+        try:
+            return _orjson.loads(path.read_bytes())
+        except Exception:
+            # Fallback: stdlib json reads via file object (lower peak RAM)
+            with open(path, encoding="utf-8") as f:
+                return _json_stdlib.load(f)
+    else:
         with open(path, encoding="utf-8") as f:
             return _json_stdlib.load(f)
 
-    JSON_BACKEND = "json (stdlib — install orjson for faster parsing)"
+
+JSON_BACKEND = "orjson (with stdlib fallback)" if _HAS_ORJSON else "json (stdlib)"
 
 
 # ===========================================================================
 # PROGRESS BAR (stdlib only, no tqdm)
 # ===========================================================================
 
+def _supports_carriage_return() -> bool:
+    """
+    Return True only when the terminal reliably overwrites lines with \\r.
+
+    Windows terminals (CMD, PowerShell, VS Code, Windows Terminal) handle \\r
+    inconsistently — it often starts a new visual line rather than overwriting.
+    Rather than probing with ctypes (which can succeed yet still not work),
+    we use a simple rule: on Windows always fall back to newline mode.
+
+    To force overwrite mode on Windows (e.g. in a known-good terminal):
+        set FIT_PARSER_CR=1  (CMD)
+        $env:FIT_PARSER_CR="1"  (PowerShell)
+    """
+    if sys.platform == "win32":
+        return os.environ.get("FIT_PARSER_CR") == "1"
+    return sys.stdout.isatty()
+
+
+_CR_SUPPORTED = _supports_carriage_return()
+
+
 class ProgressBar:
     """
     Terminal progress bar using only stdlib.
-    Renders on a single line using carriage return (\\r).
+
+    Two rendering modes (auto-detected at startup):
+      • Overwrite mode  : uses \\r to update a single line in place (Unix / Windows ANSI).
+      • Fallback mode   : prints a new line every 10% (any terminal, piped output).
+
     Shows: label | filled bar | percentage | current/total | elapsed | ETA.
     """
-    BAR_WIDTH = 30
+    BAR_WIDTH   = 30
+    LINE_WIDTH  = 100   # fixed pad width prevents stale characters from showing
 
     def __init__(self, total: int, label: str) -> None:
         self.total    = max(total, 1)
         self.label    = label
         self.current  = 0
         self.t_start  = time.monotonic()
-        self._last_render = -1.0
+        self._last_render    = -1.0
+        self._last_pct_print = -1      # for fallback mode: last % boundary printed
         self._print(force=True)
 
     def update(self, n: int = 1) -> None:
         """Advance the bar by n steps."""
         self.current = min(self.current + n, self.total)
         now = time.monotonic()
-        # Throttle rendering to ~10 fps to avoid I/O bottleneck
-        if now - self._last_render >= 0.1 or self.current == self.total:
-            self._print()
+
+        if _CR_SUPPORTED:
+            # Overwrite mode: throttle to ~10 fps
+            if now - self._last_render >= 0.1 or self.current == self.total:
+                self._print()
+        else:
+            # Fallback mode: print at every 10% boundary and at completion
+            pct_bucket = int(100 * self.current / self.total) // 10
+            if pct_bucket != self._last_pct_print or self.current == self.total:
+                self._last_pct_print = pct_bucket
+                self._print()
 
     def _fmt_seconds(self, s: float) -> str:
         s = int(s)
-        if s < 60:
-            return f"{s}s"
+        if s < 60:   return f"{s}s"
         m, s = divmod(s, 60)
-        if m < 60:
-            return f"{m}m{s:02d}s"
+        if m < 60:   return f"{m}m{s:02d}s"
         h, m = divmod(m, 60)
         return f"{h}h{m:02d}m"
 
-    def _print(self, force: bool = False) -> None:
-        now      = time.monotonic()
-        elapsed  = now - self.t_start
-        pct      = self.current / self.total
-        filled   = int(self.BAR_WIDTH * pct)
-        bar      = "█" * filled + "░" * (self.BAR_WIDTH - filled)
+    def _build_line(self) -> str:
+        elapsed = time.monotonic() - self.t_start
+        pct     = self.current / self.total
+        filled  = int(self.BAR_WIDTH * pct)
+        bar     = "█" * filled + "░" * (self.BAR_WIDTH - filled)
 
         if self.current > 0 and elapsed > 0:
-            rate = self.current / elapsed
-            eta  = (self.total - self.current) / rate if rate > 0 else 0
+            rate    = self.current / elapsed
+            eta     = (self.total - self.current) / rate if rate > 0 else 0
             eta_str = f"ETA {self._fmt_seconds(eta)}"
         else:
             eta_str = "ETA --"
 
-        line = (
+        return (
             f"  [{self.label:<22}] {bar} {pct:5.1%} "
             f"{self.current:>{len(str(self.total))}}/{self.total} "
             f"| {self._fmt_seconds(elapsed)} elapsed | {eta_str}"
         )
-        sys.stdout.write(f"\r{line}")
+
+    def _print(self, force: bool = False) -> None:
+        line = self._build_line()
+        if _CR_SUPPORTED:
+            # Pad to fixed width so shorter lines fully overwrite longer ones
+            sys.stdout.write(f"\r{line:<{self.LINE_WIDTH}}")
+        else:
+            sys.stdout.write(f"{line}\n")
         sys.stdout.flush()
-        self._last_render = now
+        self._last_render = time.monotonic()
 
     def close(self, msg: str = "✓") -> None:
         """Print final status and move to a new line."""
         elapsed = time.monotonic() - self.t_start
-        sys.stdout.write(
-            f"\r  [{self.label:<22}] done — {self.total:,} items "
-            f"in {self._fmt_seconds(elapsed)} {msg}\n"
+        final   = (
+            f"  [{self.label:<22}] done — {self.total:,} items "
+            f"in {self._fmt_seconds(elapsed)} {msg}"
         )
+        if _CR_SUPPORTED:
+            sys.stdout.write(f"\r{final:<{self.LINE_WIDTH}}\n")
+        else:
+            sys.stdout.write(f"{final}\n")
         sys.stdout.flush()
 
 
@@ -327,9 +389,21 @@ def extract_source_app(origin_id: str) -> str:
     return origin_id
 
 
-def is_derived(origin_id: str) -> bool:
-    """Return True if the data point was calculated/merged by Google."""
-    return origin_id.startswith("derived:")
+def is_derived(origin_id: str, filename: str = "") -> bool:
+    """
+    Return True if the data point belongs in fit_derived.
+
+    Two-level detection (in order of reliability):
+      1. originDataSourceId field starts with "derived:" → definitive.
+      2. Filename starts with "derived_" → fallback when the field is empty.
+         Google Fit Takeout consistently names derived files "derived_*" and
+         raw files "raw_*", even when originDataSourceId is an empty string.
+    """
+    if origin_id:
+        return origin_id.startswith("derived:")
+    # Field is empty: fall back to filename convention
+    stem = Path(filename).name if filename else ""
+    return stem.startswith("derived_")
 
 
 # ===========================================================================
@@ -388,15 +462,35 @@ def parse_all_data(folder: Path) -> Generator[tuple, None, None]:
                 continue  # explicit empty record
 
             source_app = extract_source_app(origin_id)
-            table = "fit_derived" if is_derived(origin_id) else "fit_raw"
+            table = "fit_derived" if is_derived(origin_id, filepath.name) else "fit_raw"
 
             # --- Parse fitValue ---
-            # Structure A: fitValue[].mapVal[].{key, value.{fpVal|intVal}}
-            # Structure B: fitValue[].{fpVal|intVal}  (no mapVal)
-            fit_values = point.get("fitValue", [])
+            #
+            # Google Fit Takeout JSON uses one of these structures:
+            #
+            # Key name: Takeout exports may use "fitValue" OR "value" at the
+            #   point level. We try both.
+            #
+            # Structure A — mapVal with nested value dict:
+            #   fitValue[i].mapVal[j] = {"key": "steps", "value": {"intVal": 523}}
+            #
+            # Structure B — mapVal with flat values (no "value" nesting):
+            #   fitValue[i].mapVal[j] = {"key": "percentage", "fpVal": 17.8}
+            #
+            # Structure C — direct values (no mapVal):
+            #   fitValue[i] = {"intVal": 523}           (simple types)
+            #   fitValue[i] = {"fpVal": 17.8}
+            #
+            # All four combinations (A|B) × (fitValue|value) are handled below.
+
+            fit_values = point.get("fitValue") or point.get("value") or []
+            if not isinstance(fit_values, list):
+                fit_values = []
 
             if not fit_values:
-                # No value but valid timestamp → store (marks event presence)
+                # No value array but valid timestamp → store as event marker.
+                # Some Google Fit types (e.g. activity.segment) are purely
+                # temporal markers whose meaning is encoded in start/end time.
                 yield (table, {
                     "start_ns": start_ns, "end_ns": end_ns,
                     "start_dt": ns_to_dt(start_ns), "end_dt": ns_to_dt(end_ns),
@@ -408,12 +502,19 @@ def parse_all_data(folder: Path) -> Generator[tuple, None, None]:
             for fv in fit_values:
                 map_vals = fv.get("mapVal", [])
                 if map_vals:
-                    # Structure A
+                    # Structures A and B: iterate mapVal entries
                     for mv in map_vals:
-                        key      = mv.get("key", "") or None
-                        val_dict = mv.get("value", {})
-                        fp_val   = val_dict.get("fpVal")
-                        int_val  = val_dict.get("intVal")
+                        key = mv.get("key", "") or None
+
+                        # Structure A: values nested under "value" dict
+                        nested  = mv.get("value") or {}
+                        fp_val  = nested.get("fpVal")
+                        int_val = nested.get("intVal")
+
+                        # Structure B fallback: values flat in the mapVal item
+                        if fp_val  is None: fp_val  = mv.get("fpVal")
+                        if int_val is None: int_val = mv.get("intVal")
+
                         yield (table, {
                             "start_ns":  start_ns, "end_ns": end_ns,
                             "start_dt":  ns_to_dt(start_ns), "end_dt": ns_to_dt(end_ns),
@@ -423,9 +524,24 @@ def parse_all_data(folder: Path) -> Generator[tuple, None, None]:
                             "value_int": int(int_val)   if int_val is not None else None,
                         })
                 else:
-                    # Structure B
-                    fp_val  = fv.get("fpVal")
-                    int_val = fv.get("intVal")
+                    # Structure C: no mapVal — single value directly in the fitValue item.
+                    #
+                    # Google Fit Takeout standard format (nested under "value"):
+                    #   fitValue[i] = {"value": {"fpVal": 17.8}}
+                    #   fitValue[i] = {"value": {"intVal": 523}}
+                    #
+                    # Defensive flat fallback (some third-party or legacy sources):
+                    #   fitValue[i] = {"fpVal": 17.8}
+                    #   fitValue[i] = {"intVal": 523}
+                    #
+                    # Note: the "value" nesting is NOT the same as the top-level
+                    # point.get("value") fallback for the fitValue array itself.
+                    # Here we're reading one item inside that array.
+                    nested  = fv.get("value") or {}
+                    fp_val  = nested.get("fpVal")
+                    int_val = nested.get("intVal")
+                    if fp_val  is None: fp_val  = fv.get("fpVal")
+                    if int_val is None: int_val = fv.get("intVal")
                     yield (table, {
                         "start_ns":  start_ns, "end_ns": end_ns,
                         "start_dt":  ns_to_dt(start_ns), "end_dt": ns_to_dt(end_ns),
@@ -659,12 +775,20 @@ def parse_daily_metrics(folder: Path) -> Generator[tuple, None, None]:
     bar   = ProgressBar(total, "Daily metrics (CSV)")
     count = 0
 
-    TIME_COLS = {"Start time", "End time", "startTime", "endTime"}
+    # Columns that are metadata, not measurements — exclude from the metrics table.
+    # "Date" appears in Daily Summaries.csv as the date identifier column.
+    TIME_COLS = {"Start time", "End time", "startTime", "endTime", "Date"}
 
     for filepath in files:
         bar.update()
         stem     = filepath.stem
-        date_str = stem if (len(stem) == 10 and stem[4] == "-" and stem[7] == "-") else ""
+        # Extract date from filename (YYYY-MM-DD.csv) if possible.
+        # For aggregate files like "Daily Summaries.csv", date_str is None
+        # and will be filled from start_dt at row level.
+        date_from_filename = (
+            stem if (len(stem) == 10 and stem[4] == "-" and stem[7] == "-")
+            else None
+        )
 
         try:
             with open(filepath, encoding="utf-8", newline="") as f:
@@ -672,6 +796,17 @@ def parse_daily_metrics(folder: Path) -> Generator[tuple, None, None]:
                 for row in reader:
                     start_dt = row.get("Start time") or row.get("startTime") or ""
                     end_dt   = row.get("End time")   or row.get("endTime")   or ""
+
+                    # Resolve the date for this row:
+                    # 1) from filename (most reliable, one date per file)
+                    # 2) from start_dt (Daily Summaries.csv rows have it)
+                    # 3) empty string as last resort
+                    if date_from_filename:
+                        date_str = date_from_filename
+                    elif start_dt:
+                        date_str = start_dt[:10]
+                    else:
+                        date_str = ""
 
                     for col, val in row.items():
                         if col in TIME_COLS:
@@ -790,15 +925,18 @@ def export_csv(
     from_dt: Optional[str] = None,
     to_dt: Optional[str] = None,
     tables: Optional[list] = None,
+    apply_exclusions: bool = True,
 ) -> None:
     """
     Export rows from fit_raw and/or fit_derived to CSV files.
 
     Optional filters:
-      - data_types : list of types (e.g. ["body.fat.percentage", "heart_rate.bpm"])
-      - from_dt    : start date ISO8601 or YYYY-MM-DD
-      - to_dt      : end date
-      - tables     : ["fit_raw"] | ["fit_derived"] | ["fit_raw", "fit_derived"]
+      - data_types       : list of types (e.g. ["body.fat.percentage", "heart_rate.bpm"])
+      - from_dt          : start date ISO8601 or YYYY-MM-DD
+      - to_dt            : end date
+      - tables           : ["fit_raw"] | ["fit_derived"] | ["fit_raw", "fit_derived"]
+      - apply_exclusions : if True (default), rows flagged in fit_excluded_points
+                           are omitted from the CSV. Set False to export everything.
     """
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -806,6 +944,20 @@ def export_csv(
     suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     target_tables = tables or ["fit_raw", "fit_derived"]
+
+    # Load excluded row IDs per table (if the exclusion table exists)
+    excluded_ids: dict[str, set] = {"fit_raw": set(), "fit_derived": set()}
+    if apply_exclusions:
+        excl_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='fit_excluded_points'"
+        ).fetchone()
+        if excl_exists:
+            for tbl in ("fit_raw", "fit_derived"):
+                rows = conn.execute(
+                    "SELECT row_id FROM fit_excluded_points WHERE table_name=?", (tbl,)
+                ).fetchall()
+                excluded_ids[tbl] = {r[0] for r in rows}
 
     for table in target_tables:
         exists = conn.execute(
@@ -821,18 +973,21 @@ def export_csv(
             conditions.append(f"data_type IN ({ph})")
             params.extend(data_types)
         if from_dt:
-            # Compare against the date portion of start_dt (first 10 chars: YYYY-MM-DD)
-            # to avoid timezone-offset issues in lexicographic comparison.
             conditions.append("substr(start_dt, 1, 10) >= ?")
             params.append(from_dt[:10])
         if to_dt:
             conditions.append("substr(start_dt, 1, 10) <= ?")
             params.append(to_dt[:10])
 
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"SELECT * FROM {table} {where} ORDER BY start_ns"
+        # Exclusions: use NOT IN only when there are excluded IDs
+        excl = excluded_ids.get(table, set())
+        if excl:
+            ph_excl = ",".join(str(i) for i in excl)
+            conditions.append(f"id NOT IN ({ph_excl})")
+            print(f"  [CSV] {table}: excluding {len(excl):,} flagged point(s).")
 
-        # Stream via cursor — avoids loading millions of rows into RAM at once.
+        where  = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query  = f"SELECT * FROM {table} {where} ORDER BY start_ns"
         cursor = conn.execute(query, params)
         fieldnames = [d[0] for d in cursor.description]
 
@@ -971,7 +1126,11 @@ def generate_summary(db_path: Path, output_path: Optional[Path] = None) -> dict:
     # Daily aggregates
     daily_count = conn.execute("SELECT COUNT(*) FROM fit_daily_aggregates").fetchone()[0]
     daily_cols  = conn.execute("""
-        SELECT column_name, COUNT(*) AS n, MIN(date), MAX(date)
+        SELECT
+            column_name,
+            COUNT(*)                     AS n,
+            MIN(NULLIF(date, ''))        AS first_date,
+            MAX(NULLIF(date, ''))        AS last_date
         FROM fit_daily_aggregates
         GROUP BY column_name
         ORDER BY n DESC
@@ -1085,6 +1244,11 @@ def menu_parse() -> None:
         ow = ask(f"  ⚠  {db_str} already exists. Overwrite? [y/N]", "N").upper()
         if ow != "Y":
             return
+        # Delete before parsing — otherwise rows are APPENDED to the existing
+        # tables (CREATE TABLE IF NOT EXISTS keeps them intact), which would
+        # duplicate all data on every re-run.
+        db_path.unlink()
+        print(f"  Deleted existing {db_str}")
 
     print()
     run_parse(fit_path, db_path)
@@ -1139,6 +1303,9 @@ def menu_export_csv() -> None:
 
     out_dir = ask("Output directory", "./csv_export")
 
+    apply_excl_str = ask("Apply outlier exclusions? [Y/n]", "Y").upper()
+    apply_excl     = apply_excl_str != "N"
+
     print()
     export_csv(
         db_path=db_path,
@@ -1147,6 +1314,7 @@ def menu_export_csv() -> None:
         from_dt=from_dt,
         to_dt=to_dt,
         tables=tables,
+        apply_exclusions=apply_excl,
     )
 
 
@@ -1166,20 +1334,156 @@ def menu_summary() -> None:
     generate_summary(db_path, Path(out_str))
 
 
+def create_clean_db(source_db: Path, output_db: Path) -> None:
+    """
+    Create a new SQLite database that is a physical copy of the source DB
+    with all rows in fit_excluded_points permanently removed from the data
+    tables. The exclusion table itself is NOT copied to the output.
+
+    This is NOT a destructive operation on the source — source_db is never
+    modified. The result is a clean, self-contained DB suitable for external
+    analysis or sharing, where excluded points are simply absent.
+
+    Steps:
+      1. Read all excluded (table, row_id) pairs from source.
+      2. Copy schema to output.
+      3. Stream each table row by row, skipping excluded IDs.
+      4. Rebuild indexes.
+    """
+    # Safety check FIRST: prevent accidental self-overwrite.
+    # Must happen before unlink() so the source is never deleted.
+    if source_db.resolve() == output_db.resolve():
+        print("  ❌ Source and output paths are the same file. Aborting.")
+        return
+
+    if output_db.exists():
+        print(f"  ⚠  Output file already exists: {output_db}")
+        overwrite = ask("Overwrite? [y/N]", "N").upper()
+        if overwrite != "Y":
+            return
+        output_db.unlink()
+
+    src  = sqlite3.connect(str(source_db))
+    dst  = sqlite3.connect(str(output_db))
+
+    dst.execute("PRAGMA journal_mode=WAL")
+    dst.execute("PRAGMA synchronous=NORMAL")
+    dst.execute("PRAGMA cache_size=-65536")
+
+    # Load excluded IDs per table
+    excluded: dict[str, set] = {}
+    try:
+        rows = src.execute(
+            "SELECT table_name, row_id FROM fit_excluded_points"
+        ).fetchall()
+        for tbl, rid in rows:
+            excluded.setdefault(tbl, set()).add(rid)
+        total_excl = sum(len(v) for v in excluded.values())
+        print(f"\n  Excluded points to remove: {total_excl:,}")
+    except sqlite3.OperationalError:
+        print("  No fit_excluded_points table found — output will be identical to source.")
+
+    # Tables to copy (skip the exclusion table itself)
+    DATA_TABLES = [
+        "fit_raw", "fit_derived", "fit_sessions",
+        "fit_activities", "fit_daily_aggregates",
+    ]
+
+    dst.executescript(SCHEMA)  # create tables and indexes
+
+    t0    = time.monotonic()
+    total = 0
+
+    for table in DATA_TABLES:
+        exists = src.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not exists:
+            continue
+
+        excl_set = excluded.get(table, set())
+        n_src    = src.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        n_skip   = len(excl_set)
+        n_copy   = n_src - n_skip
+
+        print(f"\n  → {table}: {n_src:,} rows  |  skipping {n_skip:,}  |  copying {n_copy:,}")
+        bar = ProgressBar(max(n_src, 1), table)
+
+        cursor = src.execute(f"SELECT * FROM {table}")
+        cols   = [d[0] for d in cursor.description]
+        ph     = ",".join("?" * len(cols))
+        insert = f"INSERT INTO {table} ({','.join(cols)}) VALUES ({ph})"
+
+        batch = []
+        written = 0
+        for row in cursor:
+            bar.update()
+            row_id = row[0]  # first column is always `id`
+            if row_id in excl_set:
+                continue
+            batch.append(row)
+            if len(batch) >= 5_000:
+                dst.executemany(insert, batch)
+                dst.commit()
+                written += len(batch)
+                batch = []
+
+        if batch:
+            dst.executemany(insert, batch)
+            dst.commit()
+            written += len(batch)
+
+        bar.close(f"✓  ({written:,} written)")
+        total += written
+
+    elapsed = time.monotonic() - t0
+    size_mb = output_db.stat().st_size / (1024 * 1024)
+    src.close()
+    dst.close()
+
+    print(f"\n  ✅ Clean DB created.")
+    print(f"     Rows written : {total:,}")
+    print(f"     Time         : {elapsed:.1f}s")
+    print(f"     Size         : {size_mb:.1f} MB")
+    print(f"     Path         : {output_db.resolve()}")
+
+
+def menu_clean_db() -> None:
+    print("\n" + "─" * 60)
+    print("  CREATE CLEAN DB (excluded outliers permanently removed)")
+    print("─" * 60)
+    print()
+    print("  This creates a NEW database with flagged outliers physically")
+    print("  absent. The source database is NOT modified.")
+    print()
+
+    src_str = ask("Source DB (with exclusions)", "fit_historical.db")
+    src_path = Path(src_str)
+    if not src_path.exists():
+        print(f"\n  ❌ Not found: {src_str}")
+        return
+
+    dst_str  = ask("Output DB filename", "fit_clean.db")
+    dst_path = Path(dst_str)
+
+    create_clean_db(src_path, dst_path)
+
+
 def run_menu() -> None:
     while True:
         print("\n" + "=" * 60)
         print("  Google Fit Takeout Parser")
-        print(f"  Model: Claude Sonnet 4.6  |  Date: 2026-05-13")
+        print(f"  Model: Claude Sonnet 4.6  |  Date: 2026-05-16")
         print("=" * 60)
         print()
         print("  1)  Parse complete Takeout → SQLite")
         print("  2)  Export CSV from existing DB")
         print("  3)  Generate compact summary (JSON)")
-        print("  4)  Exit")
+        print("  4)  Create clean DB (remove flagged outliers permanently)")
+        print("  5)  Exit")
         print()
 
-        choice = ask("Option [1–4]")
+        choice = ask("Option [1–5]")
 
         if choice == "1":
             menu_parse()
@@ -1188,6 +1492,8 @@ def run_menu() -> None:
         elif choice == "3":
             menu_summary()
         elif choice == "4":
+            menu_clean_db()
+        elif choice == "5":
             print("\n  Goodbye.\n")
             sys.exit(0)
         else:

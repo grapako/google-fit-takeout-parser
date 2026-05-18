@@ -1,6 +1,11 @@
+# ── Parser dependencies ───────────────────────────────────────────────────────
 # Optional but strongly recommended: ~5-10x faster JSON parsing
-# Install with: pip install orjson
 orjson>=3.9.0
 
-# All other dependencies are Python stdlib (no installation needed):
-# sqlite3, pathlib, csv, xml.etree.ElementTree, argparse, datetime
+# All other parser dependencies are Python stdlib:
+# sqlite3, pathlib, csv, xml.etree.ElementTree, argparse, datetime, os
+
+# ── Explorer dependencies ─────────────────────────────────────────────────────
+streamlit>=1.32.0
+plotly>=5.18.0
+pandas>=2.0.0

@@ -1,74 +1,106 @@
 # google-fit-takeout-parser
 
-Parse your **Google Fit Takeout** export into a lossless SQLite database, with CSV export and summary generation.
+Parse your **Google Fit Takeout** export into a lossless SQLite database, with CSV export, summary generation, and an interactive data explorer.
 
 If you've collected years of health data through Google Fit — steps, heart rate, body composition, GPS workouts — and want to actually use it, this tool is for you. No information is lost in the process. You decide what to simplify later.
 
 ---
 
-## What it does
+## Two tools
 
-Google Fit's Takeout export is a mess of thousands of JSON and TCX files across four folders. This script reads all of them and consolidates everything into a single **SQLite database** with clean indexes, preserving full nanosecond resolution.
+### `fit_takeout_parser.py` — CLI parser
+
+Converts the Takeout export into SQLite. Interactive menu + CLI mode.
+
+```
+  1)  Parse complete Takeout → SQLite
+  2)  Export CSV from existing DB
+  3)  Generate compact summary (JSON)
+  4)  Create clean DB (remove flagged outliers permanently)
+  5)  Exit
+```
+
+### `fit_explorer.py` — Streamlit dashboard
+
+Interactive visualization of your health data.
+
+**Data sources (switchable in the sidebar):**
+- **SQLite database** — full functionality, persistent outlier exclusions
+- **CSV files** — load CSVs exported by the parser or the explorer directly (session-only)
+
+**Features:**
+- Date range filter controls which metrics appear — no empty columns shown
+- Multi-series overlay with shared or independent Y axes
+- Line, Area, Bar, Scatter chart types
+- Daily, weekly, monthly aggregation
+- 7-day rolling trend overlay
+- Statistics panel (n, mean, median, min, max per metric)
+- Manual outlier flagging — hide points from plots without deleting from DB
+- Exclusion management — restore flagged points at any time
+- CSV export (excluded outliers omitted, clearly noted)
+- Create clean DB — produce a new SQLite with excluded rows physically absent
+
+---
+
+## What gets parsed
 
 | Source folder | Table(s) | Resolution |
 |---|---|---|
 | `All data/` | `fit_raw` + `fit_derived` | nanoseconds (maximum) |
 | `All sessions/` | `fit_sessions` | milliseconds |
 | `Activities/` | `fit_activities` | per trackpoint (GPS + HR + speed + cadence + power) |
-| `Daily activity metrics/` | `fit_daily_aggregates` | ~15 min (already aggregated by Google, stored as-is) |
+| `Daily activity metrics/` | `fit_daily_aggregates` | ~15 min (aggregated by Google, stored as-is) |
 
-`fit_raw` and `fit_derived` are kept as separate tables so you can detect inconsistencies or corrections between what each app wrote and what Google merged.
+`fit_raw` and `fit_derived` are kept separate so you can detect inconsistencies between what each app wrote and what Google merged.
 
 ---
 
 ## Requirements
 
-- Python 3.10+
-- [`orjson`](https://github.com/ijl/orjson) *(optional but recommended — ~5–10× faster JSON parsing)*
+Python 3.10+
 
 ```bash
-pip install orjson
+# Parser
+pip install orjson          # optional but ~5–10x faster JSON parsing
+
+# Explorer
+pip install streamlit plotly pandas
 ```
 
-All other dependencies are Python stdlib: `sqlite3`, `pathlib`, `csv`, `xml.etree.ElementTree`.
+All parser dependencies except `orjson` are Python stdlib.
 
 ---
 
 ## Usage
 
-### Interactive menu (recommended)
+### Parser
 
 ```bash
+# Interactive menu (recommended)
 python fit_takeout_parser.py
+
+# CLI
+python fit_takeout_parser.py parse   --input /path/to/Takeout/Fit
+python fit_takeout_parser.py export  --db fit_historical.db --types body.fat.percentage weight
+python fit_takeout_parser.py summary --db fit_historical.db --output fit_summary.json
 ```
 
-You'll get a numbered menu:
-
-```
-  1)  Parse complete Takeout → SQLite
-  2)  Export CSV from existing DB
-  3)  Generate compact summary (JSON)
-  4)  Exit
-```
-
-The script will ask for paths and filters step by step. Recommended order: **1 → 3 → 2**.
-
-### CLI mode
+### Explorer
 
 ```bash
-# Parse the full Takeout
-python fit_takeout_parser.py parse --input /path/to/Takeout/Fit
+streamlit run fit_explorer.py
+```
 
-# Export selected types as CSV
-python fit_takeout_parser.py export \
-    --db fit_historical.db \
-    --types body.fat.percentage weight heart_rate.bpm \
-    --from-date 2023-01-01
+---
 
-# Generate a compact summary
-python fit_takeout_parser.py summary \
-    --db fit_historical.db \
-    --output fit_summary.json
+## Recommended workflow
+
+```
+1. fit_takeout_parser.py → parse     → fit_historical.db
+2. fit_takeout_parser.py → summary   → fit_summary.json   (inspect what's available)
+3. fit_explorer.py       → explore, flag outliers
+4. fit_explorer.py       → Create clean DB → fit_clean.db
+5. fit_explorer.py       → export CSV for specific metrics / date ranges
 ```
 
 ---
@@ -76,29 +108,29 @@ python fit_takeout_parser.py summary \
 ## Database schema
 
 ```sql
-fit_raw               -- data written directly by each app (max fidelity)
+fit_raw               -- data written directly by each app (max fidelity, nanoseconds)
 fit_derived           -- data calculated/merged by Google
 fit_sessions          -- workout session metadata
 fit_activities        -- GPS trackpoints + HR per second (from TCX files)
 fit_daily_aggregates  -- pre-aggregated by Google (~15 min, informational)
+fit_excluded_points   -- outliers flagged in the explorer (created on first use)
 ```
 
-All tables are indexed on `(data_type, start_ns)` for fast time-series queries.
+All tables indexed on `(data_type, start_ns)` for fast time-series queries.
 
 ### Example queries
 
 ```python
-import sqlite3
-import pandas as pd
+import sqlite3, pandas as pd
 
 conn = sqlite3.connect("fit_historical.db")
 
-# Body fat over time (from Xiaomi)
+# Body fat over time (Xiaomi source)
 df = pd.read_sql("""
-    SELECT start_dt, value_fp AS body_fat_pct
+    SELECT start_dt, COALESCE(value_fp, value_int) AS body_fat_pct
     FROM fit_raw
     WHERE data_type = 'body.fat.percentage'
-    AND source_app  = 'com.xiaomi.hm.health'
+      AND source_app = 'com.xiaomi.hm.health'
     ORDER BY start_ns
 """, conn)
 
@@ -116,21 +148,11 @@ df_hr = pd.read_sql("""
 ## What gets discarded
 
 Only three categories of records are skipped:
-1. JSON files that cannot be parsed (logged as warnings during execution)
-2. Data points where both `startTimeNanos` and `endTimeNanos` are `0` (explicit empty records from Google's API)
-3. Data points with timestamps that cannot be parsed as integers
+1. JSON files that cannot be parsed (logged as warnings)
+2. Data points where both `startTimeNanos` and `endTimeNanos` are `0`
+3. Data points with non-parseable timestamps
 
 Nothing else is filtered, aggregated, or dropped.
-
----
-
-## Progress bars
-
-Each folder displays a real-time progress bar:
-
-```
-  [All data              ] ████████████░░░░░░░░░░░░░░░░░░  43.2%  8640/20000 | 1m23s elapsed | ETA 1m49s
-```
 
 ---
 
@@ -139,19 +161,13 @@ Each folder displays a real-time progress bar:
 1. Go to [takeout.google.com](https://takeout.google.com)
 2. Deselect all → select only **Fit**
 3. Export and download the ZIP
-4. Unzip → look for the `Fit/` folder inside `Takeout/`
-
----
-
-## Updating your data in the future
-
-The current scope of this tool is the **one-time historical parse**. Incremental update strategies (Health Connect backup → SQLite merge) are planned but not yet implemented.
+4. Unzip → find the `Fit/` folder inside `Takeout/`
 
 ---
 
 ## Credits
 
-This script was designed by **Juan I. Peralta** ([@grapako](https://github.com/grapako)) and generated with the assistance of **Claude Sonnet 4.6** ([Anthropic](https://www.anthropic.com)), as part of a personal health data pipeline project. The architecture, requirements, and all design decisions are the author's own.
+Designed by **Juan I. Peralta** ([@grapako](https://github.com/grapako)) and generated with the assistance of **Claude Sonnet 4.6** ([Anthropic](https://www.anthropic.com)), as part of a personal health data pipeline project. Architecture, requirements, and design decisions are the author's own.
 
 ---
 
