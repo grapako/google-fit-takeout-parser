@@ -902,7 +902,7 @@ if show_ma:
 
         if has_data:
             fig_ma.update_layout(
-                **LAYOUT_BASE, height=400,
+                **{**LAYOUT_BASE, "height": 400},
                 xaxis=dict(gridcolor="#313244"),
                 yaxis=dict(gridcolor="#313244"),
             )
