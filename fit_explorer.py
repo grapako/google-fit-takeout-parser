@@ -29,6 +29,56 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# ── Configuration ──────────────────────────────────────────────────────────────
+# Shared with the Google Fit Takeout parser.
+# file_path_config.txt is searched next to this script first.
+CONFIG_FILE = Path(__file__).resolve().parent / "file_path_config.txt"
+
+
+def load_path_config(config_file: Path = CONFIG_FILE) -> dict[str, str]:
+    """Read key=value path settings from file_path_config.txt."""
+    config = {}
+
+    if not config_file.exists():
+        return config
+
+    for raw_line in config_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if key and value:
+            config[key] = value
+
+    return config
+
+
+def resolve_config_path(value: str, config_file: Path = CONFIG_FILE) -> Path:
+    """Resolve absolute paths as-is; relative paths relative to config file."""
+    path = Path(value).expanduser()
+
+    if not path.is_absolute():
+        path = config_file.parent / path
+
+    return path.resolve()
+
+
+PATH_CONFIG = load_path_config()
+
+DEFAULT_DATABASE = resolve_config_path(
+    PATH_CONFIG.get("DATABASE", "fit_historical.db")
+)
+
+DEFAULT_CLEAN_DATABASE = resolve_config_path(
+    PATH_CONFIG.get("CLEAN_DATABASE", "fit_clean.db")
+)
+
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Fit Explorer",
@@ -529,9 +579,9 @@ def render_create_clean_db(conn, db_path: Path, csv_mode: bool):
             "Creates a **new** database file with flagged rows physically absent. "
             "The source database is **never modified**."
         )
-        dst_input = st.text_input("Output path", value="fit_clean.db")
+        dst_input = st.text_input("Output path", value=str(DEFAULT_CLEAN_DATABASE))
         if st.button("Create clean DB"):
-            dst_path = Path(dst_input)
+            dst_path = resolve_config_path(dst_input)
             if dst_path.resolve() == db_path.resolve():
                 st.error("Output path is the same as the source. Choose a different name.")
                 return
@@ -586,7 +636,7 @@ with st.sidebar:
 
     if not csv_mode:
         # ── SQLite mode ───────────────────────────────────────────────────────
-        db_path_input = st.text_input("Path to .db file", value="fit_historical.db")
+        db_path_input = st.text_input("Path to .db file", value=str(DEFAULT_DATABASE))
         db_path = Path(db_path_input)
         if not db_path.exists():
             st.error(f"Not found: `{db_path_input}`")
@@ -594,6 +644,13 @@ with st.sidebar:
         conn    = get_db_conn(str(db_path))
         conn_id = str(db_path.resolve())
         st.success("Connected ✓")
+        if PATH_CONFIG:
+            st.caption(f"Config: `{CONFIG_FILE}`")
+        else:
+            st.warning(
+                f"No `file_path_config.txt` found at `{CONFIG_FILE}`. "
+                "Using built-in defaults."
+            )
 
     else:
         # ── CSV mode ──────────────────────────────────────────────────────────

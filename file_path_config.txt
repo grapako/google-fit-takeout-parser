@@ -1,0 +1,14 @@
+# Google Fit Takeout parser path configuration
+# Relative paths are resolved relative to this file.
+# This is to support other languages than English,
+# where in Dutch (for example) "All sessions" is "Alle sessies".
+
+FIT_FOLDER=/path/to/TakeOut/Fit
+ALL_DATA_FOLDER=All data
+ALL_SESSIONS_FOLDER=All sessions
+ACTIVITIES_FOLDER=Activities
+DAILY_ACTIVITY_METRICS_FOLDER=Daily activity metrics
+DATABASE=./fit_historical.db
+CSV_EXPORT_DIR=./csv_export
+SUMMARY_JSON=./fit_summary.json
+CLEAN_DATABASE=./fit_clean.db

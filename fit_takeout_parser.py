@@ -56,6 +56,92 @@ from pathlib import Path
 from typing import Generator, Iterator, Optional
 
 # ---------------------------------------------------------------------------
+# PATH CONFIGURATION
+# ---------------------------------------------------------------------------
+# All user-specific file/folder paths are read from file_path_config.txt.
+# The config file is expected next to this script. Relative paths are
+# resolved relative to the directory containing the config file.
+CONFIG_FILE = Path(__file__).resolve().with_name("file_path_config.txt")
+
+
+CONFIG_FOLDER_KEYS = {
+    "ALL_DATA_FOLDER",
+    "ALL_SESSIONS_FOLDER",
+    "ACTIVITIES_FOLDER",
+    "DAILY_ACTIVITY_METRICS_FOLDER",
+}
+
+
+def load_path_config(config_path: Path = CONFIG_FILE) -> dict[str, Path | str]:
+    """Read paths and Takeout subfolder names from file_path_config.txt.
+
+    Path settings are resolved relative to the configuration file.
+    The four Google Fit subfolder settings are deliberately kept as strings:
+    their names are relative to FIT_FOLDER and may be localized by Google
+    Takeout (for example when the Takeout language is not English).
+    """
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Configuration file not found: {config_path}\n"
+            "Create file_path_config.txt next to this script."
+        )
+
+    config_dir = config_path.parent
+    values: dict[str, Path] = {}
+
+    with config_path.open(encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise ValueError(
+                    f"Invalid line {line_no} in {config_path.name}: {raw_line.rstrip()}"
+                )
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key or not value:
+                raise ValueError(
+                    f"Invalid line {line_no} in {config_path.name}: {raw_line.rstrip()}"
+                )
+
+            if key in CONFIG_FOLDER_KEYS:
+                # These are names of subfolders *inside* FIT_FOLDER, not
+                # filesystem paths relative to file_path_config.txt.
+                values[key] = value
+            else:
+                path = Path(value).expanduser()
+                if not path.is_absolute():
+                    path = config_dir / path
+                values[key] = path.resolve()
+
+    required = {
+        "FIT_FOLDER",
+        "DATABASE",
+        "CSV_EXPORT_DIR",
+        "SUMMARY_JSON",
+        "CLEAN_DATABASE",
+        "ALL_DATA_FOLDER",
+        "ALL_SESSIONS_FOLDER",
+        "ACTIVITIES_FOLDER",
+        "DAILY_ACTIVITY_METRICS_FOLDER",
+    }
+    missing = sorted(required - values.keys())
+    if missing:
+        raise ValueError(
+            f"Missing configuration key(s) in {config_path.name}: "
+            + ", ".join(missing)
+        )
+    return values
+
+
+def get_config() -> dict[str, Path]:
+    """Load and return the configured paths."""
+    return load_path_config()
+
+# ---------------------------------------------------------------------------
 # JSON backend: orjson if available, stdlib fallback at the call level
 # ---------------------------------------------------------------------------
 try:
@@ -1160,12 +1246,23 @@ def generate_summary(db_path: Path, output_path: Optional[Path] = None) -> dict:
 # ===========================================================================
 
 def run_parse(fit_folder: Path, db_path: Path) -> None:
-    """Coordinate all parsers and write the database."""
+    """Coordinate all parsers and write the database.
+
+    The actual Takeout subfolder names come from file_path_config.txt.
+    This is important because Google localizes these folder names according
+    to the language selected for the Takeout export.
+    """
+    try:
+        cfg = get_config()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"\n  ❌ Configuration error: {e}")
+        return
+
     folders = {
-        "All data":               fit_folder / "All data",
-        "All sessions":           fit_folder / "All sessions",
-        "Activities":             fit_folder / "Activities",
-        "Daily activity metrics": fit_folder / "Daily activity metrics",
+        cfg["ALL_DATA_FOLDER"]:               fit_folder / str(cfg["ALL_DATA_FOLDER"]),
+        cfg["ALL_SESSIONS_FOLDER"]:           fit_folder / str(cfg["ALL_SESSIONS_FOLDER"]),
+        cfg["ACTIVITIES_FOLDER"]:             fit_folder / str(cfg["ACTIVITIES_FOLDER"]),
+        cfg["DAILY_ACTIVITY_METRICS_FOLDER"]: fit_folder / str(cfg["DAILY_ACTIVITY_METRICS_FOLDER"]),
     }
 
     print(f"\n  JSON backend : {JSON_BACKEND}")
@@ -1190,13 +1287,13 @@ def run_parse(fit_folder: Path, db_path: Path) -> None:
             if not path.exists():
                 continue
             print(f"\n  → Parsing: {name}/")
-            if name == "All data":
+            if name == cfg["ALL_DATA_FOLDER"]:
                 yield from parse_all_data(path)
-            elif name == "All sessions":
+            elif name == cfg["ALL_SESSIONS_FOLDER"]:
                 yield from parse_sessions(path)
-            elif name == "Activities":
+            elif name == cfg["ACTIVITIES_FOLDER"]:
                 yield from parse_activities(path)
-            elif name == "Daily activity metrics":
+            elif name == cfg["DAILY_ACTIVITY_METRICS_FOLDER"]:
                 yield from parse_daily_metrics(path)
 
     print("\n  Starting parse (this may take several minutes)...\n")
@@ -1227,31 +1324,31 @@ def menu_parse() -> None:
     print("  PARSE COMPLETE TAKEOUT → SQLite")
     print("─" * 60)
 
-    fit_str = ask("Path to the 'Fit' folder from Takeout")
-    if not fit_str:
-        print("  Empty path, returning to menu.")
+    try:
+        cfg = get_config()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"\n  ❌ Configuration error: {e}")
         return
 
-    db_str  = ask("Output DB filename", "fit_historical.db")
-    fit_path = Path(fit_str)
-    db_path  = Path(db_str)
+#    fit_path = cfg["FIT_FOLDER"]
+    fit_folder = cfg["FIT_FOLDER"]
+    db_path = cfg["DATABASE"]
+    print(f"  Fit folder : {fit_folder}")
+    print(f"  Output DB  : {db_path}")
 
-    if not fit_path.exists():
-        print(f"\n  ❌ Path does not exist: {fit_str}")
+    if not fit_folder.exists():
+        print(f"\n  ❌ Path does not exist: {fit_folder}")
         return
 
     if db_path.exists():
-        ow = ask(f"  ⚠  {db_str} already exists. Overwrite? [y/N]", "N").upper()
+        ow = ask(f"  ⚠  {db_path} already exists. Overwrite? [y/N]", "N").upper()
         if ow != "Y":
             return
-        # Delete before parsing — otherwise rows are APPENDED to the existing
-        # tables (CREATE TABLE IF NOT EXISTS keeps them intact), which would
-        # duplicate all data on every re-run.
         db_path.unlink()
-        print(f"  Deleted existing {db_str}")
+        print(f"  Deleted existing {db_path}")
 
     print()
-    run_parse(fit_path, db_path)
+    run_parse(fit_folder, db_path)
 
 
 def menu_export_csv() -> None:
@@ -1259,15 +1356,21 @@ def menu_export_csv() -> None:
     print("  EXPORT CSV FROM DATABASE")
     print("─" * 60)
 
-    db_str  = ask("Path to DB", "fit_historical.db")
-    db_path = Path(db_str)
-
-    if not db_path.exists():
-        print(f"\n  ❌ Does not exist: {db_str}")
+    try:
+        cfg = get_config()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"\n  ❌ Configuration error: {e}")
         return
 
-    conn       = sqlite3.connect(str(db_path))
-    types_raw  = [r[0] for r in conn.execute(
+    db_path = cfg["DATABASE"]
+    out_dir = cfg["CSV_EXPORT_DIR"]
+
+    if not db_path.exists():
+        print(f"\n  ❌ Does not exist: {db_path}")
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    types_raw = [r[0] for r in conn.execute(
         "SELECT DISTINCT data_type FROM fit_raw ORDER BY data_type"
     ).fetchall()]
     conn.close()
@@ -1285,31 +1388,32 @@ def menu_export_csv() -> None:
     selected_types = None
     if sel:
         try:
-            indices        = [int(x.strip()) - 1 for x in sel.split(",")]
+            indices = [int(x.strip()) - 1 for x in sel.split(",")]
             selected_types = [types_raw[i] for i in indices if 0 <= i < len(types_raw)]
             print(f"  Selected: {selected_types}")
         except (ValueError, IndexError):
             print("  ⚠  Invalid selection, exporting all.")
 
     from_dt = ask("From date (YYYY-MM-DD, or ENTER for no limit)") or None
-    to_dt   = ask("To date   (YYYY-MM-DD, or ENTER for no limit)") or None
+    to_dt = ask("To date   (YYYY-MM-DD, or ENTER for no limit)") or None
 
     print("\n  Tables to export:")
     print("    1)  fit_raw only")
     print("    2)  fit_derived only")
     print("    3)  Both (default)")
-    sel_t  = ask("Option", "3")
-    tables = {"1": ["fit_raw"], "2": ["fit_derived"]}.get(sel_t, ["fit_raw", "fit_derived"])
+    sel_t = ask("Option", "3")
+    tables = {"1": ["fit_raw"], "2": ["fit_derived"]}.get(
+        sel_t, ["fit_raw", "fit_derived"]
+    )
 
-    out_dir = ask("Output directory", "./csv_export")
-
+    print(f"  Output directory: {out_dir}")
     apply_excl_str = ask("Apply outlier exclusions? [Y/n]", "Y").upper()
-    apply_excl     = apply_excl_str != "N"
+    apply_excl = apply_excl_str != "N"
 
     print()
     export_csv(
         db_path=db_path,
-        output_dir=Path(out_dir),
+        output_dir=out_dir,
         data_types=selected_types,
         from_dt=from_dt,
         to_dt=to_dt,
@@ -1323,15 +1427,22 @@ def menu_summary() -> None:
     print("  GENERATE SUMMARY JSON")
     print("─" * 60)
 
-    db_str  = ask("Path to DB", "fit_historical.db")
-    db_path = Path(db_str)
-
-    if not db_path.exists():
-        print(f"\n  ❌ Does not exist: {db_str}")
+    try:
+        cfg = get_config()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"\n  ❌ Configuration error: {e}")
         return
 
-    out_str = ask("Output file", "fit_summary.json")
-    generate_summary(db_path, Path(out_str))
+    db_path = cfg["DATABASE"]
+    out_path = cfg["SUMMARY_JSON"]
+
+    if not db_path.exists():
+        print(f"\n  ❌ Does not exist: {db_path}")
+        return
+
+    print(f"  Database : {db_path}")
+    print(f"  Summary  : {out_path}")
+    generate_summary(db_path, out_path)
 
 
 def create_clean_db(source_db: Path, output_db: Path) -> None:
@@ -1457,15 +1568,21 @@ def menu_clean_db() -> None:
     print("  absent. The source database is NOT modified.")
     print()
 
-    src_str = ask("Source DB (with exclusions)", "fit_historical.db")
-    src_path = Path(src_str)
-    if not src_path.exists():
-        print(f"\n  ❌ Not found: {src_str}")
+    try:
+        cfg = get_config()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"\n  ❌ Configuration error: {e}")
         return
 
-    dst_str  = ask("Output DB filename", "fit_clean.db")
-    dst_path = Path(dst_str)
+    src_path = cfg["DATABASE"]
+    dst_path = cfg["CLEAN_DATABASE"]
 
+    if not src_path.exists():
+        print(f"\n  ❌ Not found: {src_path}")
+        return
+
+    print(f"  Source DB : {src_path}")
+    print(f"  Clean DB  : {dst_path}")
     create_clean_db(src_path, dst_path)
 
 
@@ -1514,20 +1631,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   python fit_takeout_parser.py                                  # interactive menu
-  python fit_takeout_parser.py parse   --input ~/Takeout/Fit
-  python fit_takeout_parser.py export  --db fit_historical.db --types body.fat.percentage weight
-  python fit_takeout_parser.py summary --db fit_historical.db --output fit_summary.json
+  python fit_takeout_parser.py parse
+  python fit_takeout_parser.py export  --types body.fat.percentage weight
+  python fit_takeout_parser.py summary
+
+  Paths are read from file_path_config.txt. CLI path options may override them.
         """,
     )
     sub = p.add_subparsers(dest="command")
 
     s_parse = sub.add_parser("parse", help="Parse Takeout → SQLite")
-    s_parse.add_argument("--input",  required=True, help="Path to Fit folder")
-    s_parse.add_argument("--output", default="fit_historical.db")
+    s_parse.add_argument("--input", help="Override FIT_FOLDER from file_path_config.txt")
+    s_parse.add_argument("--output", help="Override DATABASE from file_path_config.txt")
 
     s_export = sub.add_parser("export", help="Export CSV from DB")
-    s_export.add_argument("--db",         required=True)
-    s_export.add_argument("--output-dir", default="./csv_export")
+    s_export.add_argument("--db",         help="Override DATABASE from file_path_config.txt")
+    s_export.add_argument("--output-dir", help="Override CSV_EXPORT_DIR from file_path_config.txt")
     s_export.add_argument("--types",      nargs="+")
     s_export.add_argument("--from-date")
     s_export.add_argument("--to-date")
@@ -1538,8 +1657,8 @@ Examples:
     )
 
     s_sum = sub.add_parser("summary", help="Generate summary JSON")
-    s_sum.add_argument("--db",     required=True)
-    s_sum.add_argument("--output", default="fit_summary.json")
+    s_sum.add_argument("--db",     help="Override DATABASE from file_path_config.txt")
+    s_sum.add_argument("--output", help="Override SUMMARY_JSON from file_path_config.txt")
 
     return p
 
@@ -1555,18 +1674,36 @@ if __name__ == "__main__":
         parser = build_arg_parser()
         args   = parser.parse_args()
 
+        try:
+            cfg = get_config()
+        except (FileNotFoundError, ValueError) as e:
+            print(f"\n❌ Configuration error: {e}")
+            sys.exit(1)
+
         if args.command == "parse":
-            run_parse(Path(args.input), Path(args.output))
+            fit_folder = Path(args.input).expanduser().resolve() if args.input else cfg["FIT_FOLDER"]
+            db_path = Path(args.output).expanduser().resolve() if args.output else cfg["DATABASE"]
+            run_parse(fit_folder, db_path)
         elif args.command == "export":
+            db_path = Path(args.db).expanduser().resolve() if args.db else cfg["DATABASE"]
+            output_dir = (
+                Path(args.output_dir).expanduser().resolve()
+                if args.output_dir else cfg["CSV_EXPORT_DIR"]
+            )
             export_csv(
-                db_path=Path(args.db),
-                output_dir=Path(args.output_dir),
+                db_path=db_path,
+                output_dir=output_dir,
                 data_types=args.types,
                 from_dt=args.from_date,
                 to_dt=args.to_date,
                 tables=args.tables,
             )
         elif args.command == "summary":
-            generate_summary(Path(args.db), Path(args.output))
+            db_path = Path(args.db).expanduser().resolve() if args.db else cfg["DATABASE"]
+            output_path = (
+                Path(args.output).expanduser().resolve()
+                if args.output else cfg["SUMMARY_JSON"]
+            )
+            generate_summary(db_path, output_path)
         else:
             build_arg_parser().print_help()
